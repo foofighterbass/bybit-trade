@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    container_name: bybit-bot
+    restart: unless-stopped        # перезапуск при краше, но не после docker stop
+    env_file: .env
+    volumes:
+      - ./data:/app/data            # SQLite БД и логи сохраняются на хосте
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"

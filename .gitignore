@@ -1,0 +1,16 @@
+# Секреты
+.env
+
+# Данные бота (БД и логи)
+data/
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
