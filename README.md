@@ -39,20 +39,23 @@ cp .env.example .env
 ```env
 BYBIT_API_KEY=your_key_here
 BYBIT_API_SECRET=your_secret_here
-BYBIT_TESTNET=true          # true = demo, false = реальные деньги
-
-GRID_SYMBOL=BTCUSDT
-GRID_LEVELS=5               # ордеров с каждой стороны от цены
-GRID_SPACING_PCT=0.5        # % расстояния между уровнями
-GRID_QTY=0.001              # объём одного ордера в BTC
-
-MAX_DAILY_LOSS_PCT=5        # стоп если дневной убыток > 5%
-MAX_DRAWDOWN_PCT=20         # стоп если просадка > 20%
+BYBIT_TESTNET=true               # true = demo, false = реальные деньги
 
 DATABASE_URL=postgresql://bot:botpass@db:5432/botdb   # оставь по умолчанию
 
-POLL_INTERVAL=30            # секунд между проверками ордеров
+MAX_DAILY_LOSS_PCT=5             # дефолт, переопределяется в strategies.json
+MAX_DRAWDOWN_PCT=20
+
+POLL_INTERVAL=30                 # секунд между проверками ордеров
+
+PAPER_TRADING=false              # true = локальное тестирование без реальных ордеров
+PAPER_PRICE_FEED=real            # real | random
+PAPER_INITIAL_BALANCE=10000
+PAPER_START_PRICE=84000          # только для random фида
+PAPER_VOLATILITY=0.3             # % на тик, только для random фида
 ```
+
+> Параметры стратегии (`symbol`, `levels`, `spacing_pct`, `qty`) задаются в `strategies.json`, не в `.env`.
 
 ---
 
