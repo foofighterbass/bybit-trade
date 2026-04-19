@@ -49,6 +49,8 @@ GRID_QTY=0.001              # объём одного ордера в BTC
 MAX_DAILY_LOSS_PCT=5        # стоп если дневной убыток > 5%
 MAX_DRAWDOWN_PCT=20         # стоп если просадка > 20%
 
+DATABASE_URL=postgresql://bot:botpass@db:5432/botdb   # оставь по умолчанию
+
 POLL_INTERVAL=30            # секунд между проверками ордеров
 ```
 
@@ -125,38 +127,143 @@ docker compose exec bot python bot.py sell BTCUSDT 0.001
 
 ```
 bybit-trade/
-├── bot.py          # точка входа, CLI, главный цикл
-├── grid.py         # логика Grid-стратегии
-├── risk.py         # риск-менеджер (дневной убыток + просадка)
-├── exchange.py     # Bybit API (pybit v5)
-├── database.py     # SQLite: сделки, ордера, PnL, история баланса
-├── config.py       # все настройки из .env
-├── data/           # SQLite БД + логи (volume, не в git)
-│   ├── trades.db
-│   └── logs/bot.log
+├── bot.py               # точка входа, весь CLI
+├── config.py            # настройки из .env
+├── strategies.json      # конфиг стратегий: параметры, капитал, вкл/выкл
+│
+├── core/                # инфраструктура
+│   ├── database.py      # PostgreSQL: сделки, ордера, PnL, история баланса
+│   ├── risk.py          # риск-менеджер
+│   └── runner.py        # запуск стратегий в потоках
+│
+├── exchange/            # всё про биржу
+│   ├── __init__.py      # публичный API
+│   ├── bybit.py         # реальный Bybit API (pybit v5)
+│   └── paper.py         # paper trading (симуляция)
+│
+├── strategies/          # торговые стратегии
+│   ├── base.py          # абстрактный класс BaseStrategy
+│   └── grid/
+│       └── strategy.py  # Grid Trading стратегия
+│
+├── data/logs/           # логи (volume, не в git)
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml   # два контейнера: bot + db (postgres:16-alpine)
 ├── requirements.txt
 └── .env.example
 ```
 
+> База данных хранится в Docker volume `pgdata` (контейнер `bybit-db`).  
+> Данные переживают рестарт и пересборку контейнеров.
+
 ---
 
-## Как работает стратегия
+## Paper trading (локальное тестирование)
 
-Бот ставит лимитные ордера выше и ниже текущей цены с шагом `GRID_SPACING_PCT`:
+Позволяет запустить бота локально, не нарушая работу уже запущенного на сервере.  
+Ордера **не отправляются** на биржу — хранятся локально. Исполнение симулируется по цене.
 
-- Исполнился **BUY** → ставит **SELL** на `spacing%` выше
-- Исполнился **SELL** → ставит **BUY** на `spacing%` ниже
-- Прибыль за цикл = `qty × price × spacing%`
+### Два режима ценового фида
+
+| `PAPER_PRICE_FEED` | Описание | Нужны API ключи |
+|---|---|---|
+| `real` | Цена берётся с Bybit API (только GET-запросы) | Да (но только чтение) |
+| `random` | Цена генерируется случайным блужданием | Нет |
+
+### Быстрый старт (random — без API ключей)
+
+```bash
+cp .env.example .env
+# Отредактируй .env:
+PAPER_TRADING=true
+PAPER_PRICE_FEED=random
+PAPER_START_PRICE=84000   # стартовая цена BTC
+PAPER_VOLATILITY=0.3      # % изменение за тик (30 сек)
+PAPER_INITIAL_BALANCE=10000
+
+# Запустить локальную БД и бота
+docker compose up -d
+```
+
+### Быстрый старт (real — реальная цена, но без ордеров)
+
+```bash
+# В .env: твои обычные Bybit testnet ключи
+PAPER_TRADING=true
+PAPER_PRICE_FEED=real
+
+docker compose up -d
+```
+
+> Ордера на биржу не отправляются в обоих случаях.  
+> Локальная БД не пересекается с БД сервера.  
+> Логи помечены `[PAPER]` для отличия от боевого режима.
+
+---
+
+## Управление стратегиями
+
+Все стратегии описаны в `strategies.json`. Пример с двумя стратегиями:
+
+```json
+[
+  {
+    "id": "grid_btc",
+    "type": "grid",
+    "enabled": true,
+    "capital_usdt": 1000,
+    "max_daily_loss_pct": 5,
+    "max_drawdown_pct": 20,
+    "params": { "symbol": "BTCUSDT", "levels": 5, "spacing_pct": 0.5, "qty": "0.001" }
+  },
+  {
+    "id": "grid_eth",
+    "type": "grid",
+    "enabled": false,
+    "capital_usdt": 500,
+    "max_daily_loss_pct": 3,
+    "max_drawdown_pct": 15,
+    "params": { "symbol": "ETHUSDT", "levels": 4, "spacing_pct": 0.6, "qty": "0.01" }
+  }
+]
+```
+
+```bash
+# Запустить все enabled=true стратегии
+docker compose exec bot python bot.py start
+
+# Запустить только одну
+docker compose exec bot python bot.py start --strategy grid_btc
+
+# Список всех стратегий с параметрами
+docker compose exec bot python bot.py strategies
+
+# Выключить стратегию: поставить "enabled": false в strategies.json, затем
+docker compose restart bot
+```
+
+Чтобы добавить новую стратегию:
+1. Создай `strategies/<name>/strategy.py` с классом унаследованным от `BaseStrategy`
+2. Зарегистрируй в `strategies/__init__.py`
+3. Добавь запись в `strategies.json`
+
+---
+
+## Как работает Grid стратегия
+
+Бот ставит лимитные ордера выше и ниже текущей цены с шагом `spacing_pct`:
+
+- Исполнился **BUY** → ставит **SELL** на `spacing_pct%` выше
+- Исполнился **SELL** → ставит **BUY** на `spacing_pct%` ниже
+- Прибыль за цикл = `qty × price × spacing_pct%`
 
 **Когда перестраивать сетку (`--reset`):**
 - Цена вышла за диапазон (все ордера одной стороны исполнились)
 - Рынок сдвинулся > 5% от центра сетки
 
-**Настройка spacing под волатильность:**
-- 0 сделок в день → уменьши spacing (0.5% → 0.3%)
-- Много сделок но малый PnL → увеличь spacing (0.5% → 0.8%)
+**Настройка `spacing_pct` под волатильность:**
+- 0 сделок в день → уменьши (0.5% → 0.3%)
+- Много сделок но малый PnL → увеличь (0.5% → 0.8%)
 - Норма: 3–10 сделок в день
 
 **Когда остановить бота:**
@@ -165,13 +272,14 @@ bybit-trade/
 
 ---
 
-## SQLite запросы
+## Запросы к базе данных
 
 ```bash
-sqlite3 data/trades.db
+# Подключиться к PostgreSQL
+docker compose exec db psql -U bot -d botdb
 
 # Дневной PnL
-SELECT date, trades, round(realized,4) FROM daily_pnl ORDER BY date DESC;
+SELECT date, trades, round(realized::numeric, 4) FROM daily_pnl ORDER BY date DESC;
 
 # Активные ордера
 SELECT side, count(*), min(price), max(price)

@@ -4,9 +4,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── API ───────────────────────────────────────────────────────────────────────
-API_KEY = os.getenv("BYBIT_API_KEY", "")
+API_KEY    = os.getenv("BYBIT_API_KEY", "")
 API_SECRET = os.getenv("BYBIT_API_SECRET", "")
-TESTNET = os.getenv("BYBIT_TESTNET", "true").lower() == "true"
+TESTNET    = os.getenv("BYBIT_TESTNET", "true").lower() == "true"
 
 if not API_KEY or not API_SECRET:
     raise EnvironmentError(
@@ -14,15 +14,19 @@ if not API_KEY or not API_SECRET:
         "Скопируй .env.example → .env и заполни ключи."
     )
 
-# ── Grid стратегия ────────────────────────────────────────────────────────────
-GRID_SYMBOL = os.getenv("GRID_SYMBOL", "BTCUSDT")
-GRID_LEVELS = int(os.getenv("GRID_LEVELS", "5"))        # ордеров с каждой стороны
-GRID_SPACING_PCT = float(os.getenv("GRID_SPACING_PCT", "0.5"))  # % между уровнями
-GRID_QTY = os.getenv("GRID_QTY", "0.001")              # объём одного ордера
+# ── Paper trading (локальное тестирование без реальных ордеров) ───────────────
+PAPER_TRADING         = os.getenv("PAPER_TRADING", "false").lower() == "true"
+PAPER_PRICE_FEED      = os.getenv("PAPER_PRICE_FEED", "real")   # "real" | "random"
+PAPER_INITIAL_BALANCE = float(os.getenv("PAPER_INITIAL_BALANCE", "10000"))
+PAPER_START_PRICE     = float(os.getenv("PAPER_START_PRICE", "84000"))  # для random фида
+PAPER_VOLATILITY      = float(os.getenv("PAPER_VOLATILITY", "0.3"))     # % на тик
 
-# ── Риск-менеджмент ───────────────────────────────────────────────────────────
-MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "5"))    # % дневного убытка
-MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "20"))       # % общей просадки
+# ── База данных ───────────────────────────────────────────────────────────────
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://bot:botpass@db:5432/botdb")
+
+# ── Риск (дефолты, переопределяются в strategies.json) ───────────────────────
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "5"))
+MAX_DRAWDOWN_PCT   = float(os.getenv("MAX_DRAWDOWN_PCT", "20"))
 
 # ── Runner ────────────────────────────────────────────────────────────────────
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))   # секунд между проверками
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))

@@ -2,14 +2,17 @@
 """
 Точка входа.
 
-  python bot.py start          # запустить автобота (восстановить состояние)
-  python bot.py start --reset  # сбросить сетку и начать заново
-  python bot.py status         # активные ордера и PnL
+  python bot.py start                        # запустить все включённые стратегии
+  python bot.py start --strategy grid_btc    # запустить одну стратегию
+  python bot.py start --reset                # сбросить сетки и начать заново
+  python bot.py status                       # PnL по всем стратегиям + ордера
+  python bot.py strategies                   # список стратегий из strategies.json
 
   python bot.py price BTCUSDT
   python bot.py balance
   python bot.py positions
   python bot.py orders
+  python bot.py history [--strategy grid_btc]
   python bot.py buy  BTCUSDT 0.001 [--type limit --price 60000]
   python bot.py sell BTCUSDT 0.001 [--type limit --price 65000]
   python bot.py cancel BTCUSDT <order_id>
@@ -22,10 +25,9 @@ import click
 from tabulate import tabulate
 
 import config
-import database
 import exchange
-from grid import GridStrategy
-from risk import RiskManager
+from core import database
+from core.runner import StrategyRunner, load_configs
 
 log = logging.getLogger(__name__)
 
@@ -38,74 +40,81 @@ def cli():
 
 
 @cli.command()
-@click.option("--reset", is_flag=True, default=False, help="Пересобрать сетку с нуля")
-def start(reset: bool):
-    """Запустить Grid-бота."""
+@click.option("--reset",    is_flag=True, default=False, help="Пересобрать сетки с нуля")
+@click.option("--strategy", default=None, help="ID конкретной стратегии (иначе все включённые)")
+def start(reset: bool, strategy: str):
+    """Запустить стратегии."""
     _setup_logging()
     database.init()
 
-    log.info("Старт | %s | testnet=%s | levels=%d | spacing=%.2f%% | qty=%s",
-             config.GRID_SYMBOL, config.TESTNET, config.GRID_LEVELS,
-             config.GRID_SPACING_PCT, config.GRID_QTY)
-
-    strategy = GridStrategy(config.GRID_SYMBOL, config.GRID_LEVELS,
-                            config.GRID_SPACING_PCT, config.GRID_QTY)
-    risk = RiskManager()
-    running = True
+    runner = StrategyRunner()
 
     def on_signal(*_):
-        nonlocal running
-        log.info("Остановка...")
-        running = False
+        nonlocal runner
+        log.info("Остановка всех стратегий...")
+        runner.stop_all()
 
-    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGINT,  on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
-    strategy.setup(reset=reset)
-
-    while running:
-        try:
-            bal_info = exchange.get_account()
-            balance  = float(bal_info.get("available", 0))
-            equity   = float(bal_info.get("equity", balance))
-            database.snapshot_balance(balance, equity)
-
-            if not risk.check(balance):
-                running = False
-                break
-
-            strategy.tick()
-
-        except Exception as exc:
-            log.error("Ошибка: %s", exc, exc_info=True)
-        time.sleep(config.POLL_INTERVAL)
-
-    strategy.shutdown()
+    runner.start(reset=reset, only=strategy)
+    runner.wait()
     log.info("Бот остановлен.")
 
 
 @cli.command()
-def status():
-    """Активные ордера и дневной PnL."""
-    database.init()
-    orders = database.load_active_orders(config.GRID_SYMBOL)
-    daily = database.get_daily_pnl()
-    bal = exchange.get_balance("USDT")
-
-    click.echo(f"\nПара:        {config.GRID_SYMBOL}")
-    click.echo(f"Режим:       {'DEMO' if config.TESTNET else 'REAL'}")
-    click.echo(f"Баланс:      {bal.get('available_balance', '?')} USDT")
-    click.echo(f"Дневной PnL: {daily:+.4f} USDT\n")
-
-    if orders:
-        rows = [[o["side"], o["price"], o["qty"], o["created_at"][:19]] for o in orders]
-        click.echo(tabulate(rows, headers=["Сторона", "Цена", "Объём", "Создан"]))
-    else:
-        click.echo("Активных ордеров нет.")
+def strategies():
+    """Список стратегий из strategies.json."""
+    cfgs = load_configs()
+    rows = [
+        [
+            c["id"],
+            c["type"],
+            "✓" if c.get("enabled", True) else "✗",
+            c.get("capital_usdt", "—"),
+            c.get("max_daily_loss_pct", config.MAX_DAILY_LOSS_PCT),
+            c.get("max_drawdown_pct",   config.MAX_DRAWDOWN_PCT),
+            str(c.get("params", {})),
+        ]
+        for c in cfgs
+    ]
+    click.echo(tabulate(
+        rows,
+        headers=["ID", "Тип", "Вкл", "Капитал", "Loss%", "DD%", "Параметры"],
+    ))
     click.echo()
 
 
-# ── Информация о счёте ───────────────────────────────────────────────────────
+@cli.command()
+def status():
+    """PnL всех стратегий за сегодня + активные ордера."""
+    database.init()
+    pnls = database.get_all_daily_pnl()
+
+    click.echo(f"\nРежим: {'DEMO' if config.TESTNET else 'REAL'}")
+    bal = exchange.get_balance("USDT")
+    click.echo(f"Баланс счёта: {bal.get('available_balance', '?')} USDT\n")
+
+    if pnls:
+        click.echo("── Дневной PnL по стратегиям ──")
+        rows = [[p["strategy_id"], p["trades"], f"{p['realized']:+.4f}"] for p in pnls]
+        click.echo(tabulate(rows, headers=["Стратегия", "Сделок", "PnL USDT"]))
+        click.echo()
+
+    for cfg in load_configs():
+        sid    = cfg["id"]
+        symbol = cfg.get("params", {}).get("symbol")
+        if not symbol:
+            continue
+        orders = database.load_active_orders(sid, symbol)
+        if orders:
+            click.echo(f"── Ордера [{sid}] ──")
+            rows = [[o["side"], o["price"], o["qty"], o["created_at"][:19]] for o in orders]
+            click.echo(tabulate(rows, headers=["Сторона", "Цена", "Объём", "Создан"]))
+            click.echo()
+
+
+# ── Информация о счёте ────────────────────────────────────────────────────────
 
 @cli.command()
 def wallets():
@@ -176,20 +185,21 @@ def account():
 
 
 @cli.command()
-@click.option("--limit", default=20, show_default=True, help="Кол-во последних сделок")
-def history(limit: int):
+@click.option("--limit",    default=20,   show_default=True)
+@click.option("--strategy", default=None, help="Фильтр по ID стратегии")
+def history(limit: int, strategy: str):
     """История исполненных сделок из БД."""
     database.init()
-    trades = database.get_trades(limit)
+    trades = database.get_trades(limit, strategy_id=strategy)
     if not trades:
         click.echo("Нет записей в истории.")
         return
     rows = [
-        [t["ts"][:19], t["symbol"], t["side"],
+        [t["ts"][:19], t["strategy_id"], t["symbol"], t["side"],
          f"{t['qty']:.4f}", f"{t['price']:.2f}"]
         for t in trades
     ]
-    click.echo(tabulate(rows, headers=["Время (UTC)", "Символ", "Сторона", "Объём", "Цена"]))
+    click.echo(tabulate(rows, headers=["Время (UTC)", "Стратегия", "Символ", "Сторона", "Объём", "Цена"]))
     click.echo()
 
 
@@ -245,7 +255,7 @@ def orders(symbol: str):
 @cli.command()
 @click.argument("symbol")
 @click.argument("qty")
-@click.option("--type", "order_type", type=click.Choice(["market", "limit"]), default="market")
+@click.option("--type",  "order_type",  type=click.Choice(["market", "limit"]), default="market")
 @click.option("--price", "order_price", default=None)
 def buy(symbol: str, qty: str, order_type: str, order_price: str):
     """Купить. Пример: python bot.py buy BTCUSDT 0.001"""
@@ -256,9 +266,9 @@ def buy(symbol: str, qty: str, order_type: str, order_price: str):
 @cli.command()
 @click.argument("symbol")
 @click.argument("qty")
-@click.option("--type", "order_type", type=click.Choice(["market", "limit"]), default="market")
-@click.option("--price", "order_price", default=None)
-@click.option("--reduce", is_flag=True, default=False)
+@click.option("--type",   "order_type",  type=click.Choice(["market", "limit"]), default="market")
+@click.option("--price",  "order_price", default=None)
+@click.option("--reduce", is_flag=True,  default=False)
 def sell(symbol: str, qty: str, order_type: str, order_price: str, reduce: bool):
     """Продать. Пример: python bot.py sell BTCUSDT 0.001"""
     r = exchange.place_order("Sell", symbol.upper(), qty, order_type.capitalize(), order_price, reduce)
@@ -274,14 +284,14 @@ def cancel(symbol: str, order_id: str):
     click.echo(f"Отменён: {r}")
 
 
-# ── Утилиты ───────────────────────────────────────────────────────────────────
+# ── Утилиты ──────────────────────────────────────────────────────────────────
 
 def _setup_logging():
     from pathlib import Path
     Path("data/logs").mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         handlers=[
             logging.StreamHandler(sys.stdout),
             logging.FileHandler("data/logs/bot.log", encoding="utf-8"),

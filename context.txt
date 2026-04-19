@@ -4,7 +4,7 @@
 (структура файлов, переменные .env, команды, зависимости) — ОБЯЗАТЕЛЬНО обновить README.md.
 
 ═══════════════════════════════════════════════════════════════
-СТАТУС ПРОЕКТА (последнее обновление: 2026-04-19)
+СТАТУС ПРОЕКТА (последнее обновление: 2026-04-19, сессия 5)
 ═══════════════════════════════════════════════════════════════
 
 Бот полностью разработан, протестирован на demo-аккаунте Bybit Testnet,
@@ -28,10 +28,14 @@
 [✅] Grid Trading стратегия с автоматическим циклом ордеров 24/7
 [✅] Восстановление состояния после рестарта (из SQLite)
 [✅] Risk Manager: стоп по дневному убытку + стоп по просадке
-[✅] SQLite БД: сделки, ордера сетки, дневной PnL, история баланса
+[✅] PostgreSQL БД в отдельном контейнере (postgres:16-alpine, volume pgdata)
 [✅] Docker + docker-compose: деплой одной командой, restart: unless-stopped
-[✅] Рефакторинг: плоская структура из 6 файлов вместо вложенных пакетов
-[✅] Тестирование: все компоненты проверены на реальном testnet
+[✅] Изоляция стратегий: strategies/ директория, BaseStrategy ABC, REGISTRY
+[✅] Параллельный запуск: StrategyRunner запускает каждую стратегию в своём потоке
+[✅] Конфиг стратегий в strategies.json: enabled, capital_usdt, risk limits, params
+[✅] strategy_id в БД: PnL, ордера и сделки изолированы по стратегии
+[✅] RiskManager работает против capital_usdt конкретной стратегии
+[✅] Paper trading режим: PAPER_TRADING=true в .env, ордера локальные, два ценовых фида
 [✅] .gitignore: .env и data/ исключены из репозитория
 [✅] README.md: пошаговые инструкции по запуску (обновлять при изменениях)
 
@@ -41,12 +45,25 @@
 ═══════════════════════════════════════════════════════════════
 
 bybit-trade/
-├── config.py       # Все настройки из .env
-├── exchange.py     # Bybit API: сессия (singleton), все вызовы
-├── database.py     # SQLite: trades, grid_orders, daily_pnl, balance_history
-├── risk.py         # RiskManager: дневной убыток + просадка
-├── grid.py         # GridStrategy: логика сетки, тик, shutdown
-├── bot.py          # Главный цикл + весь CLI (единственная точка входа)
+├── bot.py               # единственная точка входа, весь CLI
+├── config.py            # настройки из .env
+├── strategies.json      # конфиг стратегий: id, type, enabled, capital_usdt, params
+│
+├── core/                # инфраструктура
+│   ├── database.py      # PostgreSQL: trades, grid_orders, daily_pnl, balance_history
+│   ├── risk.py          # RiskManager: дневной убыток vs capital_usdt + просадка
+│   └── runner.py        # StrategyRunner: запуск стратегий в потоках
+│
+├── exchange/            # всё про биржу
+│   ├── __init__.py      # ре-экспорт → import exchange; exchange.place_order() работает
+│   ├── bybit.py         # реальный Bybit API (pybit v5)
+│   └── paper.py         # paper trading: симуляция ордеров локально
+│
+└── strategies/          # торговые стратегии
+    ├── __init__.py      # REGISTRY: {"grid": GridStrategy}
+    ├── base.py          # BaseStrategy ABC: setup/tick/shutdown
+    └── grid/
+        └── strategy.py  # Grid Trading стратегия
 ├── data/           # SQLite БД + логи (volume в Docker, не в git)
 │   ├── trades.db
 │   └── logs/bot.log
@@ -70,16 +87,37 @@ bybit-trade/
 - Для спот-торговли нужно поменять category="spot" в exchange.py
 - Сессия — singleton (_session в exchange.py), создаётся один раз
 
-── SQLite БД ────────────────────────────────────────────────
-- Путь: data/trades.db
+── PostgreSQL БД ─────────────────────────────────────────────
+- Образ: postgres:16-alpine (отдельный контейнер bybit-db)
+- Volume: pgdata (Docker managed volume, данные вне контейнера)
+- Подключение: DATABASE_URL=postgresql://bot:botpass@db:5432/botdb
+- Driver: psycopg2-binary
 - Таблицы:
   trades          — история исполненных сделок
   grid_orders     — все ордера сетки (active/filled/cancelled)
   daily_pnl       — PnL и кол-во сделок по дням
   balance_history — снапшоты баланса каждые POLL_INTERVAL секунд
-- Данные переживают рестарт бота (docker volume mount)
+- Данные переживают рестарт и пересборку контейнеров
+- Доступ: docker compose exec db psql -U bot -d botdb
 
-── Grid стратегия ───────────────────────────────────────────
+── Paper trading ────────────────────────────────────────────
+- Включить: PAPER_TRADING=true в .env
+- PAPER_PRICE_FEED=real  → цена с Bybit API (только GET, ордера не отправляются)
+- PAPER_PRICE_FEED=random → случайное блуждание, API ключи не нужны
+- paper_exchange.py: PaperExchange класс с thread-safe хранилищем ордеров
+- exchange.py: диспетчит на PaperExchange если PAPER_TRADING=true
+- Все логи paper режима помечены [PAPER]
+- Локальная БД не пересекается с сервером
+
+── Архитектура стратегий ────────────────────────────────────
+- strategies/base.py: BaseStrategy ABC (setup/tick/shutdown)
+- strategies/__init__.py: REGISTRY dict[str, type]
+- Добавить стратегию: создать strategies/<name>/strategy.py + зарегистрировать
+- runner.py: StrategyRunner — каждая enabled стратегия в отдельном threading.Thread
+- strategies.json: [{id, type, enabled, capital_usdt, max_daily_loss_pct,
+                     max_drawdown_pct, params}]
+
+── Grid стратегия (strategies/grid/strategy.py) ─────────────
 - Центр сетки = lastPrice на момент запуска
 - Уровни: center × (1 ± i × spacing/100), округление до 1 знака
 - При исполнении BUY @ P → ставит SELL @ P × (1 + spacing/100)

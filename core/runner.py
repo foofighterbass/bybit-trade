@@ -1,0 +1,101 @@
+"""Запускает стратегии параллельно в отдельных потоках."""
+import json
+import logging
+import threading
+
+import config
+import exchange
+from . import database
+from .risk import RiskManager
+from strategies import REGISTRY
+
+log = logging.getLogger(__name__)
+
+
+class StrategyRunner:
+    def __init__(self):
+        self._threads: dict[str, threading.Thread] = {}
+        self._stops:   dict[str, threading.Event]  = {}
+
+    def start(self, reset: bool = False, only: str | None = None) -> None:
+        for cfg in load_configs():
+            if not cfg.get("enabled", True):
+                log.info("[%s] отключена (enabled=false)", cfg["id"])
+                continue
+            if only and cfg["id"] != only:
+                continue
+            self._launch(cfg, reset)
+
+        if not self._threads:
+            log.warning("Нет активных стратегий для запуска. Проверь strategies.json.")
+
+    def _launch(self, cfg: dict, reset: bool) -> None:
+        sid = cfg["id"]
+        cls = REGISTRY.get(cfg["type"])
+        if not cls:
+            log.error("[%s] Неизвестный тип стратегии: %s", sid, cfg["type"])
+            return
+
+        stop = threading.Event()
+        self._stops[sid] = stop
+        t = threading.Thread(
+            target=self._loop,
+            args=(cls, cfg, reset, stop),
+            name=f"strategy-{sid}",
+            daemon=True,
+        )
+        self._threads[sid] = t
+        t.start()
+        log.info("[%s] Запущена (капитал=%s USDT)", sid, cfg.get("capital_usdt", "—"))
+
+    def _loop(self, cls, cfg: dict, reset: bool, stop: threading.Event) -> None:
+        sid     = cfg["id"]
+        capital = float(cfg.get("capital_usdt", 10_000))
+        max_dl  = float(cfg.get("max_daily_loss_pct", config.MAX_DAILY_LOSS_PCT))
+        max_dd  = float(cfg.get("max_drawdown_pct",   config.MAX_DRAWDOWN_PCT))
+
+        strategy = cls(sid, cfg["params"])
+        risk     = RiskManager(sid, capital, max_dl, max_dd)
+
+        strategy.setup(reset=reset)
+
+        while not stop.is_set():
+            try:
+                bal_info = exchange.get_account()
+                balance  = float(bal_info.get("available", 0))
+                equity   = float(bal_info.get("equity", balance))
+                database.snapshot_balance(balance, equity)
+
+                if not risk.check(balance):
+                    break
+
+                strategy.tick()
+            except Exception as exc:
+                log.error("[%s] Ошибка: %s", sid, exc, exc_info=True)
+
+            stop.wait(config.POLL_INTERVAL)
+
+        strategy.shutdown()
+        log.info("[%s] Остановлена", sid)
+
+    def stop_all(self) -> None:
+        for event in self._stops.values():
+            event.set()
+
+    def stop_one(self, strategy_id: str) -> bool:
+        if strategy_id not in self._stops:
+            return False
+        self._stops[strategy_id].set()
+        return True
+
+    def wait(self) -> None:
+        for t in self._threads.values():
+            t.join()
+
+    def running_ids(self) -> list[str]:
+        return [sid for sid, t in self._threads.items() if t.is_alive()]
+
+
+def load_configs() -> list[dict]:
+    with open("strategies.json", encoding="utf-8") as f:
+        return json.load(f)

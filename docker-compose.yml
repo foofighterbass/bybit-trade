@@ -2,12 +2,34 @@ services:
   bot:
     build: .
     container_name: bybit-bot
-    restart: unless-stopped        # перезапуск при краше, но не после docker stop
+    restart: unless-stopped
     env_file: .env
     volumes:
-      - ./data:/app/data            # SQLite БД и логи сохраняются на хосте
+      - ./data/logs:/app/data/logs
+    depends_on:
+      db:
+        condition: service_healthy
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "5"
+
+  db:
+    image: postgres:16-alpine
+    container_name: bybit-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: botdb
+      POSTGRES_USER: bot
+      POSTGRES_PASSWORD: botpass
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bot -d botdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
