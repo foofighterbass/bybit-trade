@@ -17,7 +17,6 @@
 import logging
 import signal
 import sys
-import time
 
 import click
 from tabulate import tabulate
@@ -25,7 +24,6 @@ from tabulate import tabulate
 import config
 import database
 import exchange
-import telegram
 from grid import GridStrategy
 from risk import RiskManager
 
@@ -58,7 +56,6 @@ def start(reset: bool):
     def on_signal(*_):
         nonlocal running
         log.info("Остановка...")
-        telegram.on_stop("Ручная остановка")
         running = False
 
     signal.signal(signal.SIGINT, on_signal)
@@ -68,14 +65,19 @@ def start(reset: bool):
 
     while running:
         try:
-            balance = float(exchange.get_balance("USDT").get("available_balance", 0))
+            bal_info = exchange.get_account()
+            balance  = float(bal_info.get("available", 0))
+            equity   = float(bal_info.get("equity", balance))
+            database.snapshot_balance(balance, equity)
+
             if not risk.check(balance):
                 running = False
                 break
+
             strategy.tick()
+
         except Exception as exc:
             log.error("Ошибка: %s", exc, exc_info=True)
-            telegram.on_error(str(exc))
         time.sleep(config.POLL_INTERVAL)
 
     strategy.shutdown()

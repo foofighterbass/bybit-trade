@@ -24,9 +24,5 @@ GRID_QTY = os.getenv("GRID_QTY", "0.001")              # объём одного
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "5"))    # % дневного убытка
 MAX_DRAWDOWN_PCT = float(os.getenv("MAX_DRAWDOWN_PCT", "20"))       # % общей просадки
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
 # ── Runner ────────────────────────────────────────────────────────────────────
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))   # секунд между проверками

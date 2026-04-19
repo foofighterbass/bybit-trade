@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import exchange
 import database
-import telegram
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +41,7 @@ class GridStrategy:
             self._place("Buy",  round(center * (1 - i * self.spacing), 1))
             self._place("Sell", round(center * (1 + i * self.spacing), 1))
 
-        telegram.on_start(self.symbol, self.levels, self.spacing * 100)
+
 
     def tick(self) -> None:
         open_ids = {o["orderId"] for o in exchange.get_open_orders(self.symbol)}
@@ -55,7 +54,6 @@ class GridStrategy:
             log.info("Исполнен %s @ %.1f%s", side, price, f"  pnl={pnl:+.4f}" if pnl else "")
             database.mark_filled(order_id, pnl or 0)
             database.log_trade(self.symbol, side, float(self.qty), price, order_id)
-            telegram.on_fill(side, self.symbol, price, self.qty, pnl)
 
             counter_side = "Sell" if side == "Buy" else "Buy"
             counter_price = round(price * (1 + self.spacing if side == "Buy" else 1 - self.spacing), 1)
@@ -77,7 +75,7 @@ class GridStrategy:
             log.debug("Размещён %s @ %.1f", side, price)
         except Exception as exc:
             log.error("Ошибка размещения %s @ %.1f: %s", side, price, exc)
-            telegram.on_error(f"{side} @ {price}: {exc}")
+
 
     def _cancel_all(self) -> None:
         for o in exchange.get_open_orders(self.symbol):

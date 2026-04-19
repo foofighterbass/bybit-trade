@@ -36,6 +36,13 @@ def init():
                 realized REAL NOT NULL DEFAULT 0,
                 trades   INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS balance_history (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts        TEXT NOT NULL,
+                balance   REAL NOT NULL,
+                equity    REAL NOT NULL
+            );
         """)
 
 
@@ -91,6 +98,22 @@ def get_daily_pnl(date: str | None = None) -> float:
     with _connect() as conn:
         row = conn.execute("SELECT realized FROM daily_pnl WHERE date=?", (d,)).fetchone()
     return row["realized"] if row else 0.0
+
+
+def snapshot_balance(balance: float, equity: float):
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO balance_history (ts, balance, equity) VALUES (?,?,?)",
+            (_now(), balance, equity),
+        )
+
+
+def get_balance_history(limit: int = 200) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM balance_history ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
 
 
 def get_trades(limit: int = 20) -> list[dict]:
