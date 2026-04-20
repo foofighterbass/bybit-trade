@@ -8,6 +8,8 @@
   python bot.py status                       # PnL по всем стратегиям + ордера
   python bot.py strategies                   # список стратегий из strategies.json
 
+  python bot.py set-symbol grid_btc ETHUSDT  # сменить торговую пару стратегии
+
   python bot.py price BTCUSDT
   python bot.py balance
   python bot.py positions
@@ -17,6 +19,7 @@
   python bot.py sell BTCUSDT 0.001 [--type limit --price 65000]
   python bot.py cancel BTCUSDT <order_id>
 """
+import json
 import logging
 import signal
 import sys
@@ -85,20 +88,108 @@ def strategies():
     click.echo()
 
 
+@cli.command("set-symbol")
+@click.argument("strategy_id")
+@click.argument("symbol")
+def set_symbol(strategy_id: str, symbol: str):
+    """Сменить торговую пару стратегии.
+
+    Отменяет все открытые ордера старой пары на бирже и в БД,
+    обновляет strategies.json. После этого нужен рестарт бота.
+
+    Пример:
+      python bot.py set-symbol grid_btc ETHUSDT
+    """
+    database.init()
+    symbol = symbol.upper()
+
+    cfgs = load_configs()
+    cfg  = next((c for c in cfgs if c["id"] == strategy_id), None)
+    if not cfg:
+        click.echo(f"Стратегия '{strategy_id}' не найдена в strategies.json.")
+        return
+
+    old_symbol = cfg.get("params", {}).get("symbol", "").upper()
+    if not old_symbol:
+        click.echo("У стратегии нет параметра 'symbol'.")
+        return
+
+    if old_symbol == symbol:
+        click.echo(f"Символ уже установлен: {symbol}. Ничего не изменено.")
+        return
+
+    # Проверяем что новый символ существует на бирже
+    try:
+        ticker = exchange.get_ticker(symbol)
+        current_price = ticker["lastPrice"]
+    except Exception as exc:
+        click.echo(f"Символ {symbol} не найден на бирже: {exc}")
+        return
+
+    click.echo(f"\nСмена символа для [{strategy_id}]: {old_symbol} → {symbol}")
+    click.echo(f"Текущая цена {symbol}: {current_price}\n")
+
+    # Отменяем ордера старой пары на бирже
+    cancelled_exchange = 0
+    try:
+        open_orders = exchange.get_open_orders(old_symbol)
+        for o in open_orders:
+            try:
+                exchange.cancel_order(old_symbol, o["orderId"])
+                cancelled_exchange += 1
+            except Exception as exc:
+                click.echo(f"  Не удалось отменить {o['orderId']}: {exc}")
+        click.echo(f"Отменено на бирже: {cancelled_exchange} ордеров {old_symbol}")
+    except Exception as exc:
+        click.echo(f"Ошибка при получении ордеров с биржи: {exc}")
+
+    # Помечаем ордера отменёнными в БД
+    database.cancel_all_orders(strategy_id, old_symbol)
+    click.echo(f"Ордера {old_symbol} помечены cancelled в БД.")
+
+    # Обновляем strategies.json
+    cfg["params"]["symbol"] = symbol
+    with open("strategies.json", "w", encoding="utf-8") as f:
+        json.dump(cfgs, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    click.echo(f"strategies.json обновлён: {old_symbol} → {symbol}")
+
+    click.echo(f"\nГотово. Перезапусти бота:")
+    click.echo(f"  docker compose restart bot")
+
+
 @cli.command()
 def status():
-    """PnL всех стратегий за сегодня + активные ордера."""
+    """PnL всех стратегий за сегодня + виртуальные балансы + активные ордера."""
     database.init()
-    pnls = database.get_all_daily_pnl()
 
     click.echo(f"\nРежим: {'DEMO' if config.TESTNET else 'REAL'}")
     bal = exchange.get_balance("USDT")
     click.echo(f"Баланс счёта: {bal.get('available_balance', '?')} USDT\n")
 
-    if pnls:
-        click.echo("── Дневной PnL по стратегиям ──")
-        rows = [[p["strategy_id"], p["trades"], f"{p['realized']:+.4f}"] for p in pnls]
-        click.echo(tabulate(rows, headers=["Стратегия", "Сделок", "PnL USDT"]))
+    wallets = database.get_wallets_summary()
+    if wallets:
+        pnls = {p["strategy_id"]: p for p in database.get_all_daily_pnl()}
+        click.echo("── Стратегии ──")
+        rows = []
+        for w in wallets:
+            sid   = w["strategy_id"]
+            p     = pnls.get(sid, {})
+            pnl   = p.get("realized", 0.0)
+            trade = p.get("trades", 0)
+            profit = w["virtual_balance"] - w["capital_usdt"]
+            rows.append([
+                sid,
+                f"{w['capital_usdt']:.0f}",
+                f"{w['virtual_balance']:.2f}",
+                f"{profit:+.2f}",
+                trade,
+                f"{pnl:+.4f}",
+            ])
+        click.echo(tabulate(
+            rows,
+            headers=["Стратегия", "Капитал", "Виртуал. баланс", "All-time PnL", "Сделок сегодня", "PnL сегодня"],
+        ))
         click.echo()
 
     for cfg in load_configs():

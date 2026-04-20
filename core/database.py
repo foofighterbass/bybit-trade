@@ -1,11 +1,17 @@
 """PostgreSQL: хранение состояния стратегий, истории сделок, дневного PnL."""
+import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
 
 import config
+
+log = logging.getLogger(__name__)
+
+_MIGRATIONS_DIR = Path(__file__).parent.parent / "migrations"
 
 
 @contextmanager
@@ -23,48 +29,101 @@ def _connect():
 
 
 def init():
+    """Точка входа: запускает все ожидающие миграции."""
+    migrate()
+
+
+def migrate():
+    """Применяет новые миграции из папки migrations/ в порядке имён файлов.
+
+    Уже применённые миграции пропускаются — данные не трогаются.
+    Каждый новый деплой автоматически подхватывает новые .sql файлы.
+    """
+    # Сначала создаём таблицу учёта миграций (если ещё нет)
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS trades (
-                    id          SERIAL PRIMARY KEY,
-                    ts          TEXT NOT NULL,
-                    strategy_id TEXT NOT NULL,
-                    symbol      TEXT NOT NULL,
-                    side        TEXT NOT NULL,
-                    qty         REAL NOT NULL,
-                    price       REAL NOT NULL,
-                    order_id    TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS grid_orders (
-                    order_id    TEXT PRIMARY KEY,
-                    strategy_id TEXT NOT NULL,
-                    symbol      TEXT NOT NULL,
-                    side        TEXT NOT NULL,
-                    price       REAL NOT NULL,
-                    qty         TEXT NOT NULL,
-                    status      TEXT NOT NULL DEFAULT 'active',
-                    created_at  TEXT NOT NULL,
-                    filled_at   TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS daily_pnl (
-                    date        TEXT NOT NULL,
-                    strategy_id TEXT NOT NULL,
-                    realized    REAL NOT NULL DEFAULT 0,
-                    trades      INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (date, strategy_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS balance_history (
-                    id      SERIAL PRIMARY KEY,
-                    ts      TEXT NOT NULL,
-                    balance REAL NOT NULL,
-                    equity  REAL NOT NULL
-                );
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    filename   TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
             """)
 
+    migration_files = sorted(_MIGRATIONS_DIR.glob("*.sql"))
+    if not migration_files:
+        log.warning("Папка migrations/ пуста или не найдена: %s", _MIGRATIONS_DIR)
+        return
+
+    for path in migration_files:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM schema_migrations WHERE filename = %s", (path.name,)
+                )
+                if cur.fetchone():
+                    continue  # уже применена
+
+                log.info("Применяю миграцию: %s", path.name)
+                cur.execute(path.read_text(encoding="utf-8"))
+                cur.execute(
+                    "INSERT INTO schema_migrations (filename, applied_at) VALUES (%s, %s)",
+                    (path.name, _now()),
+                )
+
+
+# ── Виртуальные кошельки стратегий ───────────────────────────────────────────
+
+def init_wallet(strategy_id: str, capital: float) -> None:
+    """Создаёт кошелёк при первом запуске; при повторных запусках ничего не меняет."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO strategy_wallets (strategy_id, capital_usdt, virtual_balance, updated_at)"
+                " VALUES (%s,%s,%s,%s) ON CONFLICT (strategy_id) DO NOTHING",
+                (strategy_id, capital, capital, _now()),
+            )
+
+
+def get_virtual_balance(strategy_id: str) -> float:
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT virtual_balance FROM strategy_wallets WHERE strategy_id=%s",
+                (strategy_id,),
+            )
+            row = cur.fetchone()
+    return float(row["virtual_balance"]) if row else 0.0
+
+
+def get_wallets_summary() -> list[dict]:
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT strategy_id, capital_usdt, virtual_balance, updated_at"
+                " FROM strategy_wallets ORDER BY strategy_id"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def _apply_pnl(cur, strategy_id: str, pnl: float) -> None:
+    """Обновляет daily_pnl и virtual_balance в одной транзакции."""
+    date = _now()[:10]
+    cur.execute(
+        "INSERT INTO daily_pnl (date, strategy_id, realized, trades) VALUES (%s,%s,%s,1)"
+        " ON CONFLICT (date, strategy_id) DO UPDATE"
+        " SET realized = daily_pnl.realized + EXCLUDED.realized,"
+        "     trades   = daily_pnl.trades + 1",
+        (date, strategy_id, pnl),
+    )
+    cur.execute(
+        "UPDATE strategy_wallets"
+        " SET virtual_balance = virtual_balance + %s, updated_at = %s"
+        " WHERE strategy_id = %s",
+        (pnl, _now(), strategy_id),
+    )
+
+
+# ── Ордера ────────────────────────────────────────────────────────────────────
 
 def save_order(strategy_id: str, order_id: str, symbol: str, side: str, price: float, qty: str):
     with _connect() as conn:
@@ -79,20 +138,21 @@ def save_order(strategy_id: str, order_id: str, symbol: str, side: str, price: f
 
 
 def mark_filled(strategy_id: str, order_id: str, pnl: float = 0.0):
-    date = _now()[:10]
+    """Для Grid: помечает ордер исполненным и обновляет PnL + виртуальный баланс."""
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE grid_orders SET status='filled', filled_at=%s WHERE order_id=%s",
                 (_now(), order_id),
             )
-            cur.execute(
-                "INSERT INTO daily_pnl (date, strategy_id, realized, trades) VALUES (%s,%s,%s,1)"
-                " ON CONFLICT (date, strategy_id) DO UPDATE"
-                " SET realized = daily_pnl.realized + EXCLUDED.realized,"
-                "     trades   = daily_pnl.trades + 1",
-                (date, strategy_id, pnl),
-            )
+            _apply_pnl(cur, strategy_id, pnl)
+
+
+def record_pnl(strategy_id: str, pnl: float) -> None:
+    """Для стратегий без ордерной таблицы (DCA и др.): фиксирует PnL сделки."""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            _apply_pnl(cur, strategy_id, pnl)
 
 
 def log_trade(strategy_id: str, symbol: str, side: str, qty: float, price: float, order_id: str):

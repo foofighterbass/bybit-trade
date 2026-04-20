@@ -12,5 +12,21 @@
       "spacing_pct": 0.5,
       "qty": "0.001"
     }
+  },
+  {
+    "id": "dca_btc",
+    "type": "dca",
+    "enabled": false,
+    "capital_usdt": 500,
+    "max_daily_loss_pct": 3,
+    "max_drawdown_pct": 15,
+    "params": {
+      "symbol": "BTCUSDT",
+      "order_qty": "0.001",
+      "interval_hours": 6,
+      "dip_pct": 1.0,
+      "take_profit_pct": 2.0,
+      "max_orders": 8
+    }
   }
 ]

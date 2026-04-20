@@ -1,6 +1,6 @@
 # Bybit Grid Trading Bot
 
-Автоматический Grid-бот для торговли на Bybit (USDT-перпетуалы). Запускается через Docker.
+Автоматический торговый бот для Bybit (USDT-перпетуалы). Поддерживает несколько стратегий с изолированными бюджетами. Запускается через Docker.
 
 ---
 
@@ -26,11 +26,8 @@
 ### 2. Настрой окружение
 
 ```bash
-# Клонируй репозиторий
 git clone https://<TOKEN>@github.com/foofighterbass/bybit-trade.git
 cd bybit-trade
-
-# Создай .env из шаблона
 cp .env.example .env
 ```
 
@@ -55,7 +52,7 @@ PAPER_START_PRICE=84000          # только для random фида
 PAPER_VOLATILITY=0.3             # % на тик, только для random фида
 ```
 
-> Параметры стратегии (`symbol`, `levels`, `spacing_pct`, `qty`) задаются в `strategies.json`, не в `.env`.
+> Параметры стратегий (`symbol`, `levels`, `qty` и т.д.) задаются в `strategies.json`, не в `.env`.
 
 ---
 
@@ -81,7 +78,8 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-Бот запустится автоматически при рестарте сервера (`restart: unless-stopped`).
+При старте бот автоматически применяет новые миграции БД — данные не теряются.  
+Бот запускается автоматически при рестарте сервера (`restart: unless-stopped`).
 
 ---
 
@@ -91,13 +89,13 @@ docker compose logs -f
 # Логи в реальном времени
 docker compose logs -f
 
-# Статус: активные ордера + дневной PnL
+# Статус: виртуальные балансы, PnL, активные ордера
 docker compose exec bot python bot.py status
 
 # Полный обзор счёта
 docker compose exec bot python bot.py account
 
-# Остановить бота (ордера на бирже отменятся)
+# Остановить бота (Grid-ордера на бирже отменятся)
 docker compose stop
 
 # Перезапустить с пересборкой после изменений кода
@@ -117,6 +115,7 @@ docker compose exec bot python bot.py balance            # баланс USDT
 docker compose exec bot python bot.py positions          # открытые позиции
 docker compose exec bot python bot.py orders             # активные ордера
 docker compose exec bot python bot.py history            # история сделок из БД
+docker compose exec bot python bot.py history --strategy dca_btc
 docker compose exec bot python bot.py wallets            # диагностика кошельков
 
 # Ручные сделки
@@ -135,9 +134,9 @@ bybit-trade/
 ├── strategies.json      # конфиг стратегий: параметры, капитал, вкл/выкл
 │
 ├── core/                # инфраструктура
-│   ├── database.py      # PostgreSQL: сделки, ордера, PnL, история баланса
-│   ├── risk.py          # риск-менеджер
-│   └── runner.py        # запуск стратегий в потоках
+│   ├── database.py      # PostgreSQL + система миграций
+│   ├── risk.py          # риск-менеджер (работает с виртуальным балансом)
+│   └── runner.py        # запуск стратегий в потоках + watchdog
 │
 ├── exchange/            # всё про биржу
 │   ├── __init__.py      # публичный API
@@ -145,13 +144,20 @@ bybit-trade/
 │   └── paper.py         # paper trading (симуляция)
 │
 ├── strategies/          # торговые стратегии
+│   ├── __init__.py      # REGISTRY: {"grid": ..., "dca": ...}
 │   ├── base.py          # абстрактный класс BaseStrategy
-│   └── grid/
-│       └── strategy.py  # Grid Trading стратегия
+│   ├── grid/
+│   │   └── strategy.py  # Grid Trading стратегия
+│   └── dca/
+│       └── strategy.py  # DCA стратегия (накопление + take-profit)
+│
+├── migrations/          # SQL-миграции схемы БД
+│   ├── 001_initial.sql
+│   └── 002_strategy_wallets.sql
 │
 ├── data/logs/           # логи (volume, не в git)
 ├── Dockerfile
-├── docker-compose.yml   # два контейнера: bot + db (postgres:16-alpine)
+├── docker-compose.yml
 ├── requirements.txt
 └── .env.example
 ```
@@ -180,33 +186,18 @@ cp .env.example .env
 # Отредактируй .env:
 PAPER_TRADING=true
 PAPER_PRICE_FEED=random
-PAPER_START_PRICE=84000   # стартовая цена BTC
-PAPER_VOLATILITY=0.3      # % изменение за тик (30 сек)
+PAPER_START_PRICE=84000
+PAPER_VOLATILITY=0.3
 PAPER_INITIAL_BALANCE=10000
 
-# Запустить локальную БД и бота
 docker compose up -d
 ```
-
-### Быстрый старт (real — реальная цена, но без ордеров)
-
-```bash
-# В .env: твои обычные Bybit testnet ключи
-PAPER_TRADING=true
-PAPER_PRICE_FEED=real
-
-docker compose up -d
-```
-
-> Ордера на биржу не отправляются в обоих случаях.  
-> Локальная БД не пересекается с БД сервера.  
-> Логи помечены `[PAPER]` для отличия от боевого режима.
 
 ---
 
 ## Управление стратегиями
 
-Все стратегии описаны в `strategies.json`. Пример с двумя стратегиями:
+Все стратегии описаны в `strategies.json`. Каждая стратегия работает с **изолированным виртуальным бюджетом** — риск-менеджер следит за просадкой именно виртуального баланса этой стратегии, а не всего счёта.
 
 ```json
 [
@@ -220,13 +211,20 @@ docker compose up -d
     "params": { "symbol": "BTCUSDT", "levels": 5, "spacing_pct": 0.5, "qty": "0.001" }
   },
   {
-    "id": "grid_eth",
-    "type": "grid",
+    "id": "dca_btc",
+    "type": "dca",
     "enabled": false,
     "capital_usdt": 500,
     "max_daily_loss_pct": 3,
     "max_drawdown_pct": 15,
-    "params": { "symbol": "ETHUSDT", "levels": 4, "spacing_pct": 0.6, "qty": "0.01" }
+    "params": {
+      "symbol": "BTCUSDT",
+      "order_qty": "0.001",
+      "interval_hours": 6,
+      "dip_pct": 1.0,
+      "take_profit_pct": 2.0,
+      "max_orders": 8
+    }
   }
 ]
 ```
@@ -241,18 +239,18 @@ docker compose exec bot python bot.py start --strategy grid_btc
 # Список всех стратегий с параметрами
 docker compose exec bot python bot.py strategies
 
-# Выключить стратегию: поставить "enabled": false в strategies.json, затем
+# Выключить стратегию: поставить "enabled": false, затем
 docker compose restart bot
 ```
 
 Чтобы добавить новую стратегию:
-1. Создай `strategies/<name>/strategy.py` с классом унаследованным от `BaseStrategy`
+1. Создай `strategies/<name>/strategy.py` с классом от `BaseStrategy`
 2. Зарегистрируй в `strategies/__init__.py`
 3. Добавь запись в `strategies.json`
 
 ---
 
-## Как работает Grid стратегия
+## Grid стратегия
 
 Бот ставит лимитные ордера выше и ниже текущей цены с шагом `spacing_pct`:
 
@@ -269,9 +267,57 @@ docker compose restart bot
 - Много сделок но малый PnL → увеличь (0.5% → 0.8%)
 - Норма: 3–10 сделок в день
 
-**Когда остановить бота:**
-- Сильный тренд 3+ дней подряд
-- Просадка приближается к `MAX_DRAWDOWN_PCT`
+---
+
+## DCA стратегия
+
+Накапливает позицию регулярными покупками, закрывает разом при достижении take-profit.
+
+**Параметры:**
+
+| Параметр | Описание |
+|---|---|
+| `order_qty` | Объём одной DCA-покупки |
+| `interval_hours` | Минимальный интервал между покупками |
+| `dip_pct` | Покупать только при откате на X% от предыдущей покупки (0 = отключено) |
+| `take_profit_pct` | Закрыть всю позицию при росте средней цены на X% |
+| `max_orders` | Максимум накопленных покупок (защита от бесконечного усреднения) |
+
+**Когда работает лучше:** в растущем или умеренно боковом рынке. Дополняет Grid: Grid зарабатывает на флэте, DCA — на тренде.
+
+**Важно при остановке:** DCA не отменяет открытую позицию автоматически. Закрыть вручную:
+```bash
+docker compose exec bot python bot.py sell BTCUSDT <qty> --reduce
+```
+
+---
+
+## Виртуальные бюджеты стратегий
+
+Каждая стратегия работает в рамках своего `capital_usdt`. Бот ведёт `virtual_balance` — текущий баланс стратегии с учётом накопленного PnL.
+
+- `MAX_DAILY_LOSS_PCT` — стоп если дневной убыток превысил X% от `capital_usdt`
+- `MAX_DRAWDOWN_PCT` — стоп если `virtual_balance` просел на X% от исторического пика
+
+Просмотр текущих балансов:
+```bash
+docker compose exec bot python bot.py status
+```
+
+---
+
+## Миграции базы данных
+
+При изменении схемы создаются пронумерованные SQL-файлы в папке `migrations/`.  
+При каждом старте бот автоматически применяет только новые миграции — данные не затрагиваются.
+
+```bash
+# Просмотр применённых миграций
+docker compose exec db psql -U bot -d botdb \
+  -c "SELECT filename, applied_at FROM schema_migrations ORDER BY filename;"
+```
+
+**Правило:** существующие файлы миграций не редактировать — только добавлять новые.
 
 ---
 
@@ -281,10 +327,16 @@ docker compose restart bot
 # Подключиться к PostgreSQL
 docker compose exec db psql -U bot -d botdb
 
-# Дневной PnL
-SELECT date, trades, round(realized::numeric, 4) FROM daily_pnl ORDER BY date DESC;
+# Виртуальные балансы стратегий
+SELECT strategy_id, capital_usdt, virtual_balance,
+       round((virtual_balance - capital_usdt)::numeric, 2) AS all_time_pnl
+  FROM strategy_wallets ORDER BY strategy_id;
 
-# Активные ордера
+# Дневной PnL
+SELECT date, strategy_id, trades, round(realized::numeric, 4)
+  FROM daily_pnl ORDER BY date DESC, strategy_id;
+
+# Активные Grid-ордера
 SELECT side, count(*), min(price), max(price)
   FROM grid_orders WHERE status='active' GROUP BY side;
 
@@ -305,4 +357,26 @@ ssh -i ~/.ssh/eu-west-1.pem ubuntu@63.32.93.247
 
 # Обновить код и перезапустить
 git pull && docker compose up -d --build
+```
+
+---
+
+## Observability
+
+Признаки нормальной работы в логах:
+```
+[grid_btc] alive | virtual_balance=1043.20 | account=9987.50 equity=9987.50
+[grid_btc] Исполнен Sell @ 85423.0  pnl=+0.4271
+```
+
+Признаки проблем:
+```
+[watchdog] Поток grid_btc мёртв — перезапускаю      ← поток упал, watchdog поднял
+[grid_btc] СТОП: Дневной убыток ...                 ← сработал риск-стоп
+[grid_btc] Сетка пустая — перестраиваю              ← все ордера исполнились
+```
+
+```bash
+# Фильтр по ключевым событиям
+docker compose logs | grep -E "СТОП|мёртв|Исполнен|alive|Ошибка"
 ```

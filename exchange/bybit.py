@@ -7,6 +7,7 @@ import config
 _session: HTTP | None = None
 _paper = None
 _paper_lock = __import__("threading").Lock()
+_account_type_cache: str | None = None
 
 
 def _get_paper():
@@ -49,15 +50,20 @@ def get_wallets_raw() -> dict[str, list]:
 
 
 def _detect_account_type() -> str:
+    global _account_type_cache
+    if _account_type_cache:
+        return _account_type_cache
     for account_type in ("UNIFIED", "CONTRACT", "SPOT"):
         try:
             data = session().get_wallet_balance(accountType=account_type)["result"]["list"]
             for acc in data:
                 for coin in acc.get("coin", []):
                     if float(coin.get("walletBalance", 0)) > 0:
+                        _account_type_cache = account_type
                         return account_type
         except Exception:
             continue
+    _account_type_cache = "UNIFIED"
     return "UNIFIED"
 
 

@@ -61,6 +61,11 @@ class GridStrategy(BaseStrategy):
             self._place(counter_side, counter_price)
             del self._orders[order_id]
 
+        if not self._orders:
+            self.log.warning("Сетка пустая — перестраиваю")
+            database.cancel_all_orders(self.id, self.symbol)
+            self.setup(reset=False)
+
     def shutdown(self) -> None:
         self.log.info("Отмена всех ордеров...")
         self._cancel_all()
