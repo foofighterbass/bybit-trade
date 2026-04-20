@@ -12,7 +12,25 @@ from strategies import REGISTRY
 
 log = logging.getLogger(__name__)
 
-_HEARTBEAT_INTERVAL = 300  # логировать "живой" каждые N секунд
+_HEARTBEAT_INTERVAL = 300   # логировать "живой" каждые N секунд
+_SNAPSHOT_INTERVAL  = 300   # записывать balance_history не чаще раза в N секунд
+
+_snapshot_lock      = threading.Lock()
+_last_snapshot_time = 0.0
+
+
+def _maybe_snapshot(balance: float, equity: float) -> None:
+    """Пишет snapshot баланса не чаще раза в _SNAPSHOT_INTERVAL секунд.
+
+    Без этого N параллельных стратегий писали бы N одинаковых строк каждый тик.
+    """
+    global _last_snapshot_time
+    now = time.monotonic()
+    with _snapshot_lock:
+        if now - _last_snapshot_time < _SNAPSHOT_INTERVAL:
+            return
+        _last_snapshot_time = now
+    database.snapshot_balance(balance, equity)
 
 
 class StrategyRunner:
@@ -34,7 +52,6 @@ class StrategyRunner:
             log.warning("Нет активных стратегий для запуска. Проверь strategies.json.")
             return
 
-        # watchdog: перезапускает упавшие потоки
         t = threading.Thread(target=self._watchdog, name="watchdog", daemon=True)
         t.start()
 
@@ -64,7 +81,7 @@ class StrategyRunner:
             for sid, t in list(self._threads.items()):
                 stop = self._stops.get(sid)
                 if stop and stop.is_set():
-                    continue  # стратегия остановлена намеренно
+                    continue
                 if not t.is_alive():
                     log.error("[watchdog] Поток %s мёртв — перезапускаю", sid)
                     cfg = self._cfgs[sid]
@@ -99,20 +116,28 @@ class StrategyRunner:
                 bal_info = exchange.get_account()
                 balance  = float(bal_info.get("available", 0))
                 equity   = float(bal_info.get("equity", balance))
-                database.snapshot_balance(balance, equity)
+                _maybe_snapshot(balance, equity)
 
                 if not risk.check():
                     log.error("[%s] Риск-лимит сработал — стратегия остановлена. "
                               "Для возобновления перезапусти бота вручную.", sid)
+                    stop.set()
                     break
 
                 strategy.tick()
 
                 now = time.monotonic()
                 if now - last_heartbeat >= _HEARTBEAT_INTERVAL:
-                    vbal = database.get_virtual_balance(sid)
-                    log.info("[%s] alive | virtual_balance=%.2f | account=%.2f equity=%.2f",
-                             sid, vbal, balance, equity)
+                    m = risk.metrics()
+                    log.info(
+                        "[%s] alive | virtual=%.2f USDT | pnl_day=%+.2f (%.1f%% из %.1f%%) | "
+                        "drawdown=%.1f%% из %.1f%% | account=%.2f",
+                        sid,
+                        m["virtual_balance"],
+                        m["daily_pnl"], m["daily_used_pct"], max_dl,
+                        m["drawdown_pct"], max_dd,
+                        balance,
+                    )
                     last_heartbeat = now
 
             except Exception as exc:

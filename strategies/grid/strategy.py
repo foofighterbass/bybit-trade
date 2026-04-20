@@ -45,6 +45,10 @@ class GridStrategy(BaseStrategy):
         open_ids = {o["orderId"] for o in exchange.get_open_orders(self.symbol)}
         filled   = [(oid, info) for oid, info in list(self._orders.items()) if oid not in open_ids]
 
+        if filled:
+            self.log.info("Исполнено ордеров: %d | активных в сетке: %d",
+                          len(filled), len(self._orders) - len(filled))
+
         for order_id, info in filled:
             price, side = info["price"], info["side"]
             pnl = float(self.qty) * price * self.spacing if side == "Sell" else None

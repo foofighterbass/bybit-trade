@@ -32,11 +32,12 @@ class DCAStrategy(BaseStrategy):
         self.take_profit_pct = float(params["take_profit_pct"])
         self.max_orders      = int(params.get("max_orders", 10))
 
-        self._position_qty:   float = 0.0
-        self._avg_price:      float = 0.0
-        self._buy_count:      int   = 0
-        self._last_buy_price: float = 0.0
-        self._last_buy_time:  float = 0.0
+        self._position_qty:    float = 0.0
+        self._avg_price:       float = 0.0
+        self._buy_count:       int   = 0
+        self._last_buy_price:  float = 0.0
+        self._last_buy_time:   float = 0.0
+        self._last_wait_log:   float = 0.0
 
     def setup(self, reset: bool = False) -> None:
         if reset:
@@ -62,12 +63,18 @@ class DCAStrategy(BaseStrategy):
                 return
 
         if self._buy_count >= self.max_orders:
-            self.log.debug("Лимит накоплений (%d) достигнут, ждём take-profit @ %.1f",
-                           self.max_orders, self._avg_price * (1 + self.take_profit_pct / 100))
+            self.log.info("Лимит накоплений %d/%d достигнут | pos=%.4f avg=%.1f | "
+                          "TP @ %.1f (осталось +%.2f%%)",
+                          self._buy_count, self.max_orders,
+                          self._position_qty, self._avg_price,
+                          self._avg_price * (1 + self.take_profit_pct / 100),
+                          self.take_profit_pct)
             return
 
         if self._should_buy(price):
             self._buy(price)
+        else:
+            self._log_waiting(price)
 
     def shutdown(self) -> None:
         if self._position_qty > 0:
@@ -77,6 +84,20 @@ class DCAStrategy(BaseStrategy):
             )
 
     # ── внутренняя логика ────────────────────────────────────────────────────
+
+    def _log_waiting(self, price: float) -> None:
+        now = time.time()
+        if now - self._last_wait_log < 1800:  # раз в 30 минут
+            return
+        self._last_wait_log = now
+        wait_left = max(0.0, self.interval_hours * 3600 - (now - self._last_buy_time))
+        msg = f"Ожидание следующей покупки | price={price:.1f} | до покупки ~{wait_left/60:.0f} мин"
+        if self.dip_pct > 0 and self._last_buy_price > 0:
+            need_price = self._last_buy_price * (1 - self.dip_pct / 100)
+            msg += f" | нужен откат до {need_price:.1f} (dip={self.dip_pct}%)"
+        if self._position_qty > 0:
+            msg += f" | pos=%.4f avg=%.1f" % (self._position_qty, self._avg_price)
+        self.log.info(msg)
 
     def _should_buy(self, price: float) -> bool:
         now = time.time()
@@ -92,22 +113,24 @@ class DCAStrategy(BaseStrategy):
 
     def _buy(self, price: float) -> None:
         try:
-            result   = exchange.place_order("Buy", self.symbol, self.order_qty, "Market")
-            qty      = float(self.order_qty)
-            old_cost = self._position_qty * self._avg_price
-            self._position_qty += qty
-            self._avg_price     = (old_cost + qty * price) / self._position_qty
-            self._buy_count    += 1
-            self._last_buy_price = price
+            result = exchange.place_order("Buy", self.symbol, self.order_qty, "Market")
+            # Bybit возвращает avgPrice для маркет-ордеров; если 0 — fallback на lastPrice
+            fill_price = float(result.get("avgPrice") or 0) or price
+            qty        = float(self.order_qty)
+            old_cost   = self._position_qty * self._avg_price
+            self._position_qty  += qty
+            self._avg_price      = (old_cost + qty * fill_price) / self._position_qty
+            self._buy_count     += 1
+            self._last_buy_price = fill_price
             self._last_buy_time  = time.time()
 
             database.log_trade(
-                self.id, self.symbol, "Buy", qty, price,
+                self.id, self.symbol, "Buy", qty, fill_price,
                 result.get("orderId", ""),
             )
             self.log.info(
                 "DCA Buy #%d | qty=%s @ %.1f | avg=%.1f | pos=%.4f | TP @ %.1f",
-                self._buy_count, self.order_qty, price,
+                self._buy_count, self.order_qty, fill_price,
                 self._avg_price, self._position_qty,
                 self._avg_price * (1 + self.take_profit_pct / 100),
             )
@@ -117,18 +140,19 @@ class DCAStrategy(BaseStrategy):
     def _close_position(self, price: float) -> None:
         qty_str = f"{self._position_qty:.4f}"
         try:
-            result = exchange.place_order(
+            result     = exchange.place_order(
                 "Sell", self.symbol, qty_str, "Market", reduce_only=True,
             )
-            pnl = self._position_qty * (price - self._avg_price)
+            fill_price = float(result.get("avgPrice") or 0) or price
+            pnl        = self._position_qty * (fill_price - self._avg_price)
             database.log_trade(
-                self.id, self.symbol, "Sell", self._position_qty, price,
+                self.id, self.symbol, "Sell", self._position_qty, fill_price,
                 result.get("orderId", ""),
             )
             database.record_pnl(self.id, pnl)
             self.log.info(
                 "Take-profit! Закрыто %.4f %s @ %.1f | avg=%.1f | pnl=%+.4f USDT",
-                self._position_qty, self.symbol, price, self._avg_price, pnl,
+                self._position_qty, self.symbol, fill_price, self._avg_price, pnl,
             )
             self._position_qty   = 0.0
             self._avg_price      = 0.0

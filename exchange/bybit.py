@@ -5,19 +5,7 @@ from pybit.unified_trading import HTTP
 import config
 
 _session: HTTP | None = None
-_paper = None
-_paper_lock = __import__("threading").Lock()
 _account_type_cache: str | None = None
-
-
-def _get_paper():
-    global _paper
-    if _paper is None:
-        with _paper_lock:
-            if _paper is None:
-                from exchange.paper import PaperExchange
-                _paper = PaperExchange()
-    return _paper
 
 
 def session() -> HTTP:
@@ -33,8 +21,6 @@ def session() -> HTTP:
 
 def get_wallets_raw() -> dict[str, list]:
     """Возвращает сырые данные по всем кошелькам для диагностики."""
-    if config.PAPER_TRADING:
-        return _get_paper().get_wallets_raw()
     result = {}
     try:
         data = session().get_wallet_balance(accountType="UNIFIED")["result"]["list"]
@@ -68,8 +54,6 @@ def _detect_account_type() -> str:
 
 
 def get_account() -> dict:
-    if config.PAPER_TRADING:
-        return _get_paper().get_account()
     account_type = _detect_account_type()
     data = session().get_wallet_balance(accountType=account_type)["result"]["list"]
     if not data:
@@ -97,8 +81,6 @@ def get_account() -> dict:
 
 
 def get_balance(coin: str = "USDT") -> dict:
-    if config.PAPER_TRADING:
-        return _get_paper().get_balance(coin)
     account_type = _detect_account_type()
     resp = session().get_wallet_balance(accountType=account_type, coin=coin)
     for account in resp["result"]["list"]:
@@ -115,8 +97,6 @@ def get_balance(coin: str = "USDT") -> dict:
 
 
 def get_ticker(symbol: str) -> dict:
-    if config.PAPER_TRADING:
-        return _get_paper().get_ticker(symbol)
     items = session().get_tickers(category="linear", symbol=symbol)["result"]["list"]
     if not items:
         raise ValueError(f"Тикер {symbol} не найден")
@@ -124,8 +104,6 @@ def get_ticker(symbol: str) -> dict:
 
 
 def get_positions(symbol: Optional[str] = None) -> list[dict]:
-    if config.PAPER_TRADING:
-        return _get_paper().get_positions(symbol)
     kwargs: dict = {"category": "linear", "settleCoin": "USDT"}
     if symbol:
         kwargs["symbol"] = symbol
@@ -133,8 +111,6 @@ def get_positions(symbol: Optional[str] = None) -> list[dict]:
 
 
 def get_open_orders(symbol: Optional[str] = None) -> list[dict]:
-    if config.PAPER_TRADING:
-        return _get_paper().get_open_orders(symbol)
     kwargs: dict = {"category": "linear"}
     if symbol:
         kwargs["symbol"] = symbol
@@ -151,8 +127,6 @@ def place_order(
     price: Optional[str] = None,
     reduce_only: bool = False,
 ) -> dict:
-    if config.PAPER_TRADING:
-        return _get_paper().place_order(side, symbol, qty, order_type, price, reduce_only)
     if order_type == "Limit" and not price:
         raise ValueError("Для лимитного ордера нужна цена")
     kwargs: dict = {
@@ -170,8 +144,6 @@ def place_order(
 
 
 def cancel_order(symbol: str, order_id: str) -> dict:
-    if config.PAPER_TRADING:
-        return _get_paper().cancel_order(symbol, order_id)
     return session().cancel_order(
         category="linear", symbol=symbol, orderId=order_id
     )["result"]

@@ -106,14 +106,19 @@ def get_wallets_summary() -> list[dict]:
 
 
 def _apply_pnl(cur, strategy_id: str, pnl: float) -> None:
-    """Обновляет daily_pnl и virtual_balance в одной транзакции."""
-    date = _now()[:10]
+    """Обновляет daily_pnl и virtual_balance в одной транзакции.
+
+    Счётчик trades инкрементируется только при pnl != 0 (завершённый цикл),
+    чтобы Grid-покупки (pnl=0) не искажали статистику.
+    """
+    date       = _now()[:10]
+    trade_incr = 1 if pnl != 0 else 0
     cur.execute(
-        "INSERT INTO daily_pnl (date, strategy_id, realized, trades) VALUES (%s,%s,%s,1)"
+        "INSERT INTO daily_pnl (date, strategy_id, realized, trades) VALUES (%s,%s,%s,%s)"
         " ON CONFLICT (date, strategy_id) DO UPDATE"
         " SET realized = daily_pnl.realized + EXCLUDED.realized,"
-        "     trades   = daily_pnl.trades + 1",
-        (date, strategy_id, pnl),
+        "     trades   = daily_pnl.trades + EXCLUDED.trades",
+        (date, strategy_id, pnl, trade_incr),
     )
     cur.execute(
         "UPDATE strategy_wallets"
